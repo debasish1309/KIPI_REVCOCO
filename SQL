@@ -1,0 +1,300 @@
+-- 1. Create Database and Schema
+CREATE DATABASE IF NOT EXISTS KIPI_RevCOCO;
+USE DATABASE KIPI_RevCOCO;
+CREATE SCHEMA IF NOT EXISTS MVP;
+USE SCHEMA MVP;
+
+
+-- 2. Create Contracts Table (The Pricing Source of Truth)
+CREATE OR REPLACE TABLE contracts (
+    client_id VARCHAR,
+    client_name VARCHAR,
+    print_rate FLOAT,
+    digital_rate FLOAT,
+    contract_start_date DATE
+);
+
+INSERT INTO contracts VALUES 
+    ('C001', 'Acme Corp', 0.15, 0.05, '2025-01-01'),
+    ('C002', 'Global Tech', 0.12, 0.04, '2025-02-01'),
+    ('C003', 'Local Bank', 0.18, 0.06, '2024-06-01');
+
+-- 3. Create Production Logs (The Disconnected Events)
+CREATE OR REPLACE TABLE production_logs (
+    event_id VARCHAR DEFAULT UUID_STRING(),
+    client_id VARCHAR,
+    event_type VARCHAR, -- 'PRINT' or 'DIGITAL'
+    quantity INT,
+    event_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Insert some mock production data
+INSERT INTO production_logs (client_id, event_type, quantity, event_timestamp) VALUES 
+    ('C001', 'PRINT', 10000, DATEADD(day, -2, CURRENT_TIMESTAMP())),
+    ('C001', 'DIGITAL', 50000, DATEADD(day, -1, CURRENT_TIMESTAMP())),
+    ('C002', 'PRINT', 5000, CURRENT_TIMESTAMP()),
+    ('C003', 'DIGITAL', 100000, CURRENT_TIMESTAMP());
+
+    
+-- 4. Create Historical Receivables (For Cortex ML Training)
+-- We need historical data showing which invoices were paid late to train the model.
+CREATE OR REPLACE TABLE receivables_history (
+    invoice_id VARCHAR,
+    client_id VARCHAR,
+    invoice_amount FLOAT,
+    days_to_pay INT,
+    past_dso_avg INT, -- Client's historical average days to pay
+    is_late BOOLEAN   -- TARGET VARIABLE for ML (True if paid past 30 days)
+);
+
+-- Insert synthetic training data (patterns: C003 is often late, higher amounts tend to be later)
+INSERT INTO receivables_history VALUES 
+    ('INV-100', 'C001', 1500.00, 15, 16, FALSE),
+    ('INV-101', 'C001', 2500.00, 20, 16, FALSE),
+    ('INV-102', 'C002', 800.00,  28, 25, FALSE),
+    ('INV-103', 'C003', 6000.00, 45, 40, TRUE),
+    ('INV-104', 'C003', 7500.00, 50, 40, TRUE),
+    ('INV-105', 'C002', 5000.00, 35, 25, TRUE);
+
+-- 5.Expand contracts to 50 clients (reference table)
+INSERT INTO contracts
+SELECT
+    'C' || LPAD(ROW_NUMBER() OVER (ORDER BY SEQ4()), 3, '0')        AS client_id,
+    CASE FLOOR(UNIFORM(1, 6, RANDOM()))
+        WHEN 1 THEN 'Pinnacle Solutions'
+        WHEN 2 THEN 'Bright Media'
+        WHEN 3 THEN 'Sterling Logistics'
+        WHEN 4 THEN 'Nexus Retail'
+        WHEN 5 THEN 'Summit Finance'
+    END || ' ' || ROW_NUMBER() OVER (ORDER BY SEQ4())                AS client_name,
+    ROUND(UNIFORM(0.10, 0.20, RANDOM()), 2)                         AS print_rate,
+    ROUND(UNIFORM(0.03, 0.08, RANDOM()), 3)                         AS digital_rate,
+    DATEADD(day, -FLOOR(UNIFORM(30, 730, RANDOM())), CURRENT_DATE()) AS contract_start_date
+FROM TABLE(GENERATOR(ROWCOUNT => 47)); -- 47 new + 3 existing = 50 total
+
+
+-- 6.Generate 1,000,000 rows for production_logs
+INSERT INTO production_logs (client_id, event_type, quantity, event_timestamp)
+SELECT
+    -- Assign to one of 50 clients, weighted so C001-C010 are busier
+    'C' || LPAD(
+        CASE
+            WHEN UNIFORM(0.0, 1.0, RANDOM()) < 0.40  -- 40% go to top 10 clients
+            THEN FLOOR(UNIFORM(1, 10, RANDOM()))
+            ELSE FLOOR(UNIFORM(1, 50, RANDOM()))
+        END,
+        3, '0'
+    )                                                               AS client_id,
+
+    -- PRINT is ~60%, DIGITAL is ~40%
+    CASE WHEN UNIFORM(0.0, 1.0, RANDOM()) < 0.60
+        THEN 'PRINT' ELSE 'DIGITAL'
+    END                                                             AS event_type,
+
+    -- PRINT: lower qty (1k–50k), DIGITAL: higher qty (10k–500k)
+    CASE WHEN UNIFORM(0.0, 1.0, RANDOM()) < 0.60
+        THEN FLOOR(UNIFORM(1000,  50000,  RANDOM()))
+        ELSE FLOOR(UNIFORM(10000, 500000, RANDOM()))
+    END                                                             AS quantity,
+
+    -- Spread events across the last 2 years
+    DATEADD(
+        second,
+        -FLOOR(UNIFORM(0, 63072000, RANDOM())), -- 63072000s = 2 years
+        CURRENT_TIMESTAMP()
+    )                                                               AS event_timestamp
+
+FROM TABLE(GENERATOR(ROWCOUNT => 1000000));
+
+-- 7. Generate 1,000,000 rows for receivables_history
+INSERT INTO receivables_history
+WITH base AS (
+    SELECT
+        SEQ4() + 200                                                AS seq_num, -- offset past existing INV-1xx
+
+        -- Client bucketing: 20% "risky" clients (like C003), 80% normal
+        CASE
+            WHEN UNIFORM(0.0, 1.0, RANDOM()) < 0.20
+            THEN 'C' || LPAD(FLOOR(UNIFORM(30, 50, RANDOM())), 3, '0') -- risky band
+            ELSE 'C' || LPAD(FLOOR(UNIFORM(1,  29, RANDOM())), 3, '0') -- normal band
+        END                                                         AS client_id,
+
+        -- Invoice amount: skewed, most are small, some are large
+        ROUND(
+            CASE WHEN UNIFORM(0.0, 1.0, RANDOM()) < 0.70
+                THEN UNIFORM(500.0,  5000.0,  RANDOM())
+                ELSE UNIFORM(5000.0, 50000.0, RANDOM())
+            END,
+            2
+        )                                                           AS invoice_amount,
+
+        -- past_dso_avg: risky clients average 35-55, normal 10-30
+        CASE
+            WHEN UNIFORM(0.0, 1.0, RANDOM()) < 0.20
+            THEN FLOOR(UNIFORM(35, 55, RANDOM()))
+            ELSE FLOOR(UNIFORM(10, 30, RANDOM()))
+        END                                                         AS past_dso_avg
+
+    FROM TABLE(GENERATOR(ROWCOUNT => 1000000))
+),
+with_payment AS (
+    SELECT
+        seq_num,
+        client_id,
+        invoice_amount,
+        past_dso_avg,
+
+        -- days_to_pay: anchored around past_dso_avg with variance
+        -- Large invoices add 0-15 extra days
+        GREATEST(1, FLOOR(
+            past_dso_avg
+            + UNIFORM(-10, 20, RANDOM())                            -- natural variance
+            + CASE WHEN invoice_amount > 10000 THEN FLOOR(UNIFORM(0, 15, RANDOM())) ELSE 0 END
+        ))                                                          AS days_to_pay
+
+    FROM base
+)
+SELECT
+    'INV-' || LPAD(seq_num, 6, '0')                                AS invoice_id,
+    client_id,
+    invoice_amount,
+    days_to_pay,
+    past_dso_avg,
+    (days_to_pay > 30)                                              AS is_late
+FROM with_payment;
+
+-- 8.Verification Queries
+-- Row counts
+SELECT 'contracts'          AS tbl, COUNT(*) AS "rows" FROM contracts
+UNION ALL
+SELECT 'production_logs',              COUNT(*) FROM production_logs
+UNION ALL
+SELECT 'receivables_history',          COUNT(*) FROM receivables_history;
+
+-- Check ML signal: is_late rate should be ~30-40%
+SELECT
+    is_late,
+    COUNT(*)                          AS count,
+    ROUND(AVG(invoice_amount), 2)     AS avg_amount,
+    ROUND(AVG(past_dso_avg), 1)       AS avg_dso
+FROM receivables_history
+GROUP BY is_late;
+
+-- Production log event distribution
+SELECT
+    event_type,
+    COUNT(*)                          AS events,
+    ROUND(AVG(quantity), 0)           AS avg_qty,
+    MIN(event_timestamp)              AS earliest,
+    MAX(event_timestamp)              AS latest
+FROM production_logs
+GROUP BY event_type;
+
+--9. Top 10 rows
+-- Top 10 from contracts
+SELECT * FROM contracts LIMIT 50;
+
+-- Top 10 from production_logs
+SELECT * FROM production_logs LIMIT 50;
+
+-- Top 10 from receivables_history
+SELECT * FROM receivables_history LIMIT 50;
+
+
+SELECT * FROM contracts
+WHERE client_id IS NULL
+   OR client_name IS NULL
+   OR print_rate IS NULL
+   OR digital_rate IS NULL
+   OR contract_start_date IS NULL;
+
+DELETE FROM contracts
+WHERE client_id IS NULL
+   OR client_name IS NULL
+   OR print_rate IS NULL
+   OR digital_rate IS NULL
+   OR contract_start_date IS NULL;
+
+ALTER TABLE contracts ALTER COLUMN client_id SET NOT NULL;
+ALTER TABLE contracts ALTER COLUMN client_name SET NOT NULL;
+ALTER TABLE contracts ALTER COLUMN print_rate SET NOT NULL;
+ALTER TABLE contracts ALTER COLUMN digital_rate SET NOT NULL;
+ALTER TABLE contracts ALTER COLUMN contract_start_date SET NOT NULL;
+
+SELECT COUNT(*) AS total_rows,
+       COUNT(client_id) AS non_null_client_id,
+       COUNT(client_name) AS non_null_client_name,
+       COUNT(print_rate) AS non_null_print_rate,
+       COUNT(digital_rate) AS non_null_digital_rate,
+       COUNT(contract_start_date) AS non_null_contract_start_date
+FROM contracts;
+
+SELECT MAX(client_id) FROM contracts;
+
+INSERT INTO contracts
+SELECT
+    'C' || LPAD(ROW_NUMBER() OVER (ORDER BY SEQ4()) + (SELECT COUNT(*) FROM contracts), 3, '0') AS client_id,
+    CASE FLOOR(UNIFORM(1, 6, RANDOM()))
+        WHEN 1 THEN 'Pinnacle Solutions'
+        WHEN 2 THEN 'Bright Media'
+        WHEN 3 THEN 'Sterling Logistics'
+        WHEN 4 THEN 'Nexus Retail'
+        WHEN 5 THEN 'Summit Finance'
+    END || ' ' || (ROW_NUMBER() OVER (ORDER BY SEQ4()) + (SELECT COUNT(*) FROM contracts)) AS client_name,
+    ROUND(UNIFORM(0.10, 0.20, RANDOM()), 2)                          AS print_rate,
+    ROUND(UNIFORM(0.03, 0.08, RANDOM()), 3)                          AS digital_rate,
+    DATEADD(day, -FLOOR(UNIFORM(30, 730, RANDOM())), CURRENT_DATE()) AS contract_start_date
+FROM TABLE(GENERATOR(ROWCOUNT => 9));
+
+-- Check total count
+SELECT COUNT(*) FROM contracts;
+-- Should return 50
+
+-- Check no NULLs
+SELECT * FROM contracts
+WHERE client_id IS NULL
+   OR client_name IS NULL
+   OR print_rate IS NULL
+   OR digital_rate IS NULL
+   OR contract_start_date IS NULL;
+-- Should return 0 rows
+
+-- View the 9 newly added rows
+SELECT * FROM contracts
+ORDER BY client_id DESC
+LIMIT 9;
+
+SELECT 
+    COUNT(*) AS total_rows,
+    COUNT(event_id) AS non_null_event_id,
+    COUNT(client_id) AS non_null_client_id,
+    COUNT(event_type) AS non_null_event_type,
+    COUNT(quantity) AS non_null_quantity,
+    COUNT(event_timestamp) AS non_null_event_timestamp
+FROM production_logs;
+
+
+SELECT * FROM production_logs
+WHERE event_id IS NULL
+   OR client_id IS NULL
+   OR event_type IS NULL
+   OR quantity IS NULL
+   OR event_timestamp IS NULL;
+
+SELECT 
+    COUNT(*) AS total_rows,
+    COUNT(invoice_id) AS non_null_invoice_id,
+    COUNT(client_id) AS non_null_client_id,
+    COUNT(invoice_amount) AS non_null_invoice_amount,
+    COUNT(days_to_pay) AS non_null_days_to_pay,
+    COUNT(past_dso_avg) AS non_null_past_dso_avg,
+    COUNT(is_late) AS non_null_is_late
+FROM receivables_history;
+
+SELECT * FROM receivables_history
+WHERE invoice_id IS NULL
+   OR client_id IS NULL
+   OR invoice_amount IS NULL
+   OR days_to_pay IS NULL
+   OR past_dso_avg IS NULL
+   OR is_late IS NULL;
